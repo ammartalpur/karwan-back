@@ -18,7 +18,6 @@ import { getRoute } from "./routeService.js";
 const TICK_MS = 1000;
 const PROGRESS_PER_TICK = 4;
 const ARRIVAL_PROGRESS = 96;
-const simulators = new Map();
 
 function one(relation) {
   return Array.isArray(relation) ? relation[0] : relation;
@@ -56,27 +55,75 @@ async function mapDelivery(group) {
     depotId: group.depotId,
     requestId: group.requestId,
   });
-  const progressPct = Math.max(...group.rows.map((row) => row.progress_pct ?? 0));
   const status = groupStatus(group.rows);
+  const storedProgress = Math.max(
+    ...group.rows.map((row) => row.progress_pct ?? 0),
+  );
+  const startedAt = group.rows
+    .map((row) => row.started_at)
+    .filter(Boolean)
+    .sort()[0];
+  const elapsedTicks = startedAt
+    ? Math.max(
+        0,
+        Math.floor((Date.now() - new Date(startedAt).getTime()) / TICK_MS),
+      )
+    : 0;
+  const progressPct =
+    status === "in_transit"
+      ? Math.min(
+          ARRIVAL_PROGRESS,
+          Math.max(storedProgress, elapsedTicks * PROGRESS_PER_TICK),
+        )
+      : storedProgress;
   const startPoint = route.polyline[0];
   const endPoint = route.polyline.at(-1);
+  const currentPoint =
+    status === "in_transit"
+      ? positionAlongRoute(route.polyline, progressPct)
+      : null;
+
+  // Vercel functions cannot keep an in-memory interval alive after a request.
+  // Persist elapsed-time progress whenever a client polls this endpoint.
+  if (status === "in_transit" && progressPct > storedProgress) {
+    await Promise.all([
+      updateAllocationProgress(
+        group.rows.map((row) => row.id),
+        {
+          progress_pct: progressPct,
+        },
+      ),
+      updateVehicleState(group.vehicleId, {
+        current_lat: Number(currentPoint.lat.toFixed(6)),
+        current_lng: Number(currentPoint.lng.toFixed(6)),
+      }),
+    ]);
+  }
+
   return {
     allocationId: first.id,
     allocationIds: group.rows.map((row) => row.id),
     vehicleId: group.vehicleId,
     requestId: group.requestId,
     createdAt: first.created_at,
+    startedAt,
     status,
     progressPct,
     lat:
       status === "in_transit"
-        ? (vehicle?.current_lat ?? startPoint?.[0] ?? depot?.lat)
+        ? (currentPoint?.lat ??
+          vehicle?.current_lat ??
+          startPoint?.[0] ??
+          depot?.lat)
         : status === "delivered"
           ? (endPoint?.[0] ?? request?.lat)
           : (startPoint?.[0] ?? depot?.lat),
     lng:
       status === "in_transit"
-        ? (vehicle?.current_lng ?? startPoint?.[1] ?? depot?.lng)
+        ? (currentPoint?.lng ??
+          vehicle?.current_lng ??
+          startPoint?.[1] ??
+          depot?.lng)
         : status === "delivered"
           ? (endPoint?.[1] ?? request?.lng)
           : (startPoint?.[1] ?? depot?.lng),
@@ -118,8 +165,13 @@ async function calculateRequestStatus(requestId) {
   const state = await findRequestDeliveryState(requestId);
   const items = state.request?.request_items ?? [];
   const needed = items.reduce((total, item) => total + item.qty_needed, 0);
-  const allocated = items.reduce((total, item) => total + item.qty_allocated, 0);
-  if (state.allocations.some((allocation) => allocation.status === "in_transit")) {
+  const allocated = items.reduce(
+    (total, item) => total + item.qty_allocated,
+    0,
+  );
+  if (
+    state.allocations.some((allocation) => allocation.status === "in_transit")
+  ) {
     return "in_transit";
   }
   if (
@@ -137,7 +189,10 @@ async function calculateRequestStatus(requestId) {
 
 async function finishGroup(group) {
   const ids = group.rows.map((row) => row.id);
-  await updateAllocationProgress(ids, { status: "delivered", progress_pct: 100 });
+  await updateAllocationProgress(ids, {
+    status: "delivered",
+    progress_pct: 100,
+  });
   const requestStatus = await calculateRequestStatus(group.requestId);
   await updateDeliveryRequestStatus(group.requestId, requestStatus);
   if (!(await vehicleHasInTransitAllocations(group.vehicleId))) {
@@ -151,50 +206,14 @@ async function finishGroup(group) {
   return requestStatus;
 }
 
-function stopSimulator(key) {
-  const running = simulators.get(key);
-  if (running) clearInterval(running.timer);
-  simulators.delete(key);
-}
-
-function startSimulator(group, route, initialProgress = 0) {
-  stopSimulator(group.key);
-  let progress = initialProgress;
-  let updating = false;
-  const timer = setInterval(async () => {
-    if (updating) return;
-    updating = true;
-    try {
-      progress = Math.min(ARRIVAL_PROGRESS, progress + PROGRESS_PER_TICK);
-      const point = positionAlongRoute(route.polyline, progress);
-      const ids = group.rows.map((row) => row.id);
-      await updateAllocationProgress(ids, {
-        progress_pct: progress,
-      });
-      await updateVehicleState(group.vehicleId, {
-        current_lat: Number(point.lat.toFixed(6)),
-        current_lng: Number(point.lng.toFixed(6)),
-      });
-      if (progress === ARRIVAL_PROGRESS) {
-        stopSimulator(group.key);
-      }
-    } catch (error) {
-      console.error(`Truck simulator failed for ${group.key}`, error);
-      stopSimulator(group.key);
-    } finally {
-      updating = false;
-    }
-  }, TICK_MS);
-  timer.unref?.();
-  simulators.set(group.key, { timer });
-}
-
 export async function startDeliveries(input) {
   const selection = validateStartDeliveries(input);
   const groups = groupRows(await findDeliveryRows());
   const requestedIds = selection.all ? null : new Set(selection.allocationIds);
   if (requestedIds) {
-    const existingIds = new Set(groups.flatMap((group) => group.rows.map((row) => row.id)));
+    const existingIds = new Set(
+      groups.flatMap((group) => group.rows.map((row) => row.id)),
+    );
     if ([...requestedIds].some((id) => !existingIds.has(id))) {
       throw notFound([...requestedIds].find((id) => !existingIds.has(id)));
     }
@@ -213,8 +232,13 @@ export async function startDeliveries(input) {
       .filter((group) => groupStatus(group.rows) === "in_transit")
       .map((group) => group.vehicleId),
   );
-  if (!selection.all && selected.some((group) => busyVehicles.has(group.vehicleId))) {
-    throw invalidState("The assigned vehicle already has a delivery in transit");
+  if (
+    !selection.all &&
+    selected.some((group) => busyVehicles.has(group.vehicleId))
+  ) {
+    throw invalidState(
+      "The assigned vehicle already has a delivery in transit",
+    );
   }
   selected = selected.filter((group) => !busyVehicles.has(group.vehicleId));
 
@@ -226,11 +250,18 @@ export async function startDeliveries(input) {
   });
 
   for (const group of selected) {
-    const route = await getRoute({ depotId: group.depotId, requestId: group.requestId });
+    const route = await getRoute({
+      depotId: group.depotId,
+      requestId: group.requestId,
+    });
     const start = route.polyline[0];
     await updateAllocationProgress(
       group.rows.map((row) => row.id),
-      { status: "in_transit", progress_pct: 0 },
+      {
+        status: "in_transit",
+        progress_pct: 0,
+        started_at: new Date().toISOString(),
+      },
     );
     await updateVehicleState(group.vehicleId, {
       status: "busy",
@@ -238,7 +269,6 @@ export async function startDeliveries(input) {
       current_lng: start[1],
     });
     await updateDeliveryRequestStatus(group.requestId, "in_transit");
-    startSimulator(group, route);
   }
   return { started: selected.length };
 }
@@ -253,11 +283,10 @@ export async function completeDelivery(allocationId, input = {}) {
   if (groupStatus(group.rows) !== "in_transit") {
     throw invalidState("Start the trip before marking it delivered");
   }
-  stopSimulator(group.key);
   const requestStatus = await finishGroup(group);
   return { allocationId, status: "delivered", requestStatus };
 }
 
 export function stopAllDeliverySimulators() {
-  for (const key of simulators.keys()) stopSimulator(key);
+  // Kept for reset-service compatibility. Progress is stateless on serverless hosts.
 }
